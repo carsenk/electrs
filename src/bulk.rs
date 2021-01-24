@@ -1,7 +1,6 @@
 use bitcoin::blockdata::block::Block;
 use bitcoin::consensus::encode::{deserialize, Decodable};
 use bitcoin::hash_types::BlockHash;
-use libc;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Cursor;
@@ -19,7 +18,6 @@ use crate::metrics::{CounterVec, Histogram, HistogramOpts, HistogramVec, MetricO
 use crate::signal::Waiter;
 use crate::store::{DBStore, Row, WriteStore};
 use crate::util::{spawn_thread, HeaderList, SyncChannel};
-use bitcoin::BitcoinHash;
 
 struct Parser {
     magic: u32,
@@ -89,7 +87,7 @@ impl Parser {
         let mut rows = Vec::<Row>::new();
         let timer = self.duration.with_label_values(&["index"]).start_timer();
         for block in blocks {
-            let blockhash = block.bitcoin_hash();
+            let blockhash = block.block_hash();
             if let Some(header) = self.current_headers.header_by_blockhash(&blockhash) {
                 if self
                     .indexed_blockhashes
@@ -240,37 +238,33 @@ pub fn index_blk_files(
     let indexers: Vec<JoinHandle> = (0..index_threads)
         .map(|_| start_indexer(blobs.clone(), parser.clone(), rows_chan.sender()))
         .collect();
-    let signal = signal.clone();
-    spawn_thread("bulk_writer", move || -> Result<DBStore> {
-        for (rows, path) in rows_chan.into_receiver() {
-            trace!("indexed {:?}: {} rows", path, rows.len());
-            store.write(rows);
-            signal
-                .poll()
-                .chain_err(|| "stopping bulk indexing due to signal")?;
-        }
-        reader
-            .join()
-            .expect("reader panicked")
-            .expect("reader failed");
 
-        indexers.into_iter().for_each(|i| {
-            i.join()
-                .expect("indexer panicked")
-                .expect("indexing failed")
-        });
-        store.write(vec![parser.last_indexed_row()]);
-        Ok(store)
-    })
-    .join()
-    .expect("writer panicked")
+    for (rows, path) in rows_chan.into_receiver() {
+        trace!("indexed {:?}: {} rows", path, rows.len());
+        store.write(rows);
+        signal
+            .poll()
+            .chain_err(|| "stopping bulk indexing due to signal")?;
+    }
+    reader
+        .join()
+        .expect("reader panicked")
+        .expect("reader failed");
+
+    indexers.into_iter().for_each(|i| {
+        i.join()
+            .expect("indexer panicked")
+            .expect("indexing failed")
+    });
+    store.write(vec![parser.last_indexed_row()]);
+    Ok(store)
 }
 
 #[cfg(test)]
 mod tests {
 
     use super::*;
-    use bitcoin_hashes::Hash;
+    use bitcoin::hashes::Hash;
     use hex::decode as hex_decode;
 
     #[test]
@@ -280,7 +274,7 @@ mod tests {
         let blocks = parse_blocks(raw_blocks, magic).unwrap();
         assert_eq!(blocks.len(), 2);
         assert_eq!(
-            blocks[1].bitcoin_hash().into_inner().to_vec(),
+            blocks[1].block_hash().into_inner().to_vec(),
             hex_decode("d55acd552414cc44a761e8d6b64a4d555975e208397281d115336fc500000000").unwrap()
         );
     }

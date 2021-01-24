@@ -1,13 +1,10 @@
-use base64;
 use bitcoin::blockdata::block::{Block, BlockHeader};
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hash_types::{BlockHash, Txid};
+use bitcoin::hashes::hex::{FromHex, ToHex};
+use bitcoin::hashes::Hash;
 use bitcoin::network::constants::Network;
-use bitcoin_hashes::hex::{FromHex, ToHex};
-use bitcoin_hashes::Hash;
-use glob;
-use hex;
 use serde_json::{from_str, from_value, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Lines, Write};
@@ -22,7 +19,6 @@ use crate::errors::*;
 use crate::metrics::{HistogramOpts, HistogramVec, Metrics};
 use crate::signal::Waiter;
 use crate::util::HeaderList;
-use bitcoin::BitcoinHash;
 
 fn parse_hash<T: Hash>(value: &Value) -> Result<T> {
     Ok(T::from_hex(
@@ -125,7 +121,7 @@ pub struct MempoolEntry {
 }
 
 impl MempoolEntry {
-    fn new(fee: u64, vsize: u32) -> MempoolEntry {
+    pub(crate) fn new(fee: u64, vsize: u32) -> MempoolEntry {
         MempoolEntry {
             fee,
             vsize,
@@ -321,7 +317,7 @@ impl Daemon {
                 signal.clone(),
             )?),
             message_id: Counter::new(),
-            blocktxids_cache: blocktxids_cache,
+            blocktxids_cache,
             signal: signal.clone(),
             latency: metrics.histogram_vec(
                 HistogramOpts::new("electrs_daemon_rpc", "Bitcoind RPC latency (in seconds)"),
@@ -349,6 +345,9 @@ impl Daemon {
         loop {
             let info = daemon.getblockchaininfo()?;
             if !info.initialblockdownload {
+                break;
+            }
+            if network == Network::Regtest && info.headers == info.blocks {
                 break;
             }
             warn!(
@@ -497,7 +496,7 @@ impl Daemon {
         let block = block_from_value(
             self.request("getblock", json!([blockhash.to_hex(), /*verbose=*/ false]))?,
         )?;
-        assert_eq!(block.bitcoin_hash(), *blockhash);
+        assert_eq!(block.block_hash(), *blockhash);
         Ok(block)
     }
 
@@ -626,7 +625,7 @@ impl Daemon {
         let mut blockhash = null_hash;
         for header in &result {
             assert_eq!(header.prev_blockhash, blockhash);
-            blockhash = header.bitcoin_hash();
+            blockhash = header.block_hash();
         }
         assert_eq!(blockhash, *tip);
         Ok(result)

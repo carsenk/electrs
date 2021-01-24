@@ -1,17 +1,20 @@
-FROM rust:1.42.0-slim-buster
+FROM rust:1.44.1-slim-buster
 
-RUN apt-get update
-RUN apt-get install -y clang cmake
-RUN apt-get install -y libsnappy-dev
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends clang=1:7.* cmake=3.* \
+     libsnappy-dev=1.* curl \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/*
 
 RUN adduser --disabled-login --system --shell /bin/false --uid 1000 user
 
-USER user
 WORKDIR /home/user
 COPY ./ /home/user
+RUN chown -R user .
 
-RUN cargo build --release
-RUN cargo install --path .
+USER user
+
+RUN cargo install --locked --path .
 
 # Electrum RPC
 EXPOSE 50001
@@ -20,3 +23,5 @@ EXPOSE 50001
 EXPOSE 4224
 
 STOPSIGNAL SIGINT
+
+HEALTHCHECK CMD curl -fSs http://localhost:4224/ || exit 1

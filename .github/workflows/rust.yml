@@ -1,17 +1,37 @@
-name: Rust
+name: electrs CI
 
 on: [push, pull_request]
 
 jobs:
-  build:
-
+  electrs:
+    name: electrs
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v1
-    - name: Check
-      run: cargo check
-    - name: Build
-      run: cargo build
-    - name: Run tests
-      run: cargo test
+      - name: Checkout sources
+        uses: actions/checkout@v2
+
+      - name: Install rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+          profile: minimal
+          override: true
+
+      - name: Format
+        uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+
+      - name: Build
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --locked --release --all
+
+      - name: Test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --locked --release --all

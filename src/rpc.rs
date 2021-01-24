@@ -1,21 +1,20 @@
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin_hashes::hex::{FromHex, ToHex};
-use bitcoin_hashes::{sha256d::Hash as Sha256dHash, Hash};
+use bitcoin::hashes::hex::{FromHex, ToHex};
+use bitcoin::hashes::{sha256d::Hash as Sha256dHash, Hash};
 use error_chain::ChainedError;
-use hex;
 use serde_json::{from_str, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::query::{Query, Status};
-use crate::util::{spawn_thread, Channel, HeaderEntry, SyncChannel};
+use crate::util::{spawn_thread, Channel, HeaderEntry};
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "1.4";
@@ -75,7 +74,7 @@ struct Connection {
     status_hashes: HashMap<Sha256dHash, Value>, // ScriptHash -> StatusHash
     stream: TcpStream,
     addr: SocketAddr,
-    chan: SyncChannel<Message>,
+    sender: SyncSender<Message>,
     stats: Arc<Stats>,
     relayfee: f64,
 }
@@ -87,6 +86,7 @@ impl Connection {
         addr: SocketAddr,
         stats: Arc<Stats>,
         relayfee: f64,
+        sender: SyncSender<Message>,
     ) -> Connection {
         Connection {
             query,
@@ -94,7 +94,7 @@ impl Connection {
             status_hashes: HashMap::new(),
             stream,
             addr,
-            chan: SyncChannel::new(10),
+            sender,
             stats,
             relayfee,
         }
@@ -108,7 +108,26 @@ impl Connection {
         Ok(result)
     }
 
-    fn server_version(&self) -> Result<Value> {
+    fn server_version(&self, params: &[Value]) -> Result<Value> {
+        if params.len() != 2 {
+            bail!("invalid params: {:?}", params);
+        }
+        let client_id = params[0]
+            .as_str()
+            .chain_err(|| format!("invalid client_id: {:?}", params[0]))?;
+        // TODO: support (min, max) protocol version limits
+        let client_version = params[1]
+            .as_str()
+            .chain_err(|| format!("invalid client_version: {:?}", params[1]))?;
+
+        if client_version != PROTOCOL_VERSION {
+            bail!(
+                "{} requested protocol version {}, server supports {}",
+                client_id,
+                client_version,
+                PROTOCOL_VERSION
+            );
+        }
         Ok(json!([
             format!("electrs {}", ELECTRS_VERSION),
             PROTOCOL_VERSION
@@ -206,7 +225,11 @@ impl Connection {
             hash_from_value::<Sha256dHash>(params.get(0)).chain_err(|| "bad script_hash")?;
         let status = self.query.status(&script_hash[..])?;
         let result = status.hash().map_or(Value::Null, |h| json!(hex::encode(h)));
-        if let None = self.status_hashes.insert(script_hash, result.clone()) {
+        if self
+            .status_hashes
+            .insert(script_hash, result.clone())
+            .is_none()
+        {
             self.stats.subscriptions.inc();
         }
 
@@ -248,7 +271,7 @@ impl Connection {
         let tx: Transaction = deserialize(&tx).chain_err(|| "failed to parse tx")?;
         let txid = self.query.broadcast(&tx)?;
         self.query.update_mempool()?;
-        if let Err(e) = self.chan.sender().try_send(Message::PeriodicUpdate) {
+        if let Err(e) = self.sender.try_send(Message::PeriodicUpdate) {
             warn!("failed to issue PeriodicUpdate after broadcast: {}", e);
         }
         Ok(json!(txid.to_hex()))
@@ -261,6 +284,11 @@ impl Connection {
             None => false,
         };
         Ok(self.query.get_transaction(&tx_hash, verbose)?)
+    }
+
+    fn blockchain_transaction_get_confirmed_blockhash(&self, params: &[Value]) -> Result<Value> {
+        let tx_hash = hash_from_value(params.get(0)).chain_err(|| "bad tx_hash")?;
+        self.query.get_confirmed_blockhash(&tx_hash)
     }
 
     fn blockchain_transaction_get_merkle(&self, params: &[Value]) -> Result<Value> {
@@ -314,6 +342,9 @@ impl Connection {
             "blockchain.transaction.broadcast" => self.blockchain_transaction_broadcast(&params),
             "blockchain.transaction.get" => self.blockchain_transaction_get(&params),
             "blockchain.transaction.get_merkle" => self.blockchain_transaction_get_merkle(&params),
+            "blockchain.transaction.get_confirmed_blockhash" => {
+                self.blockchain_transaction_get_confirmed_blockhash(&params)
+            }
             "blockchain.transaction.id_from_pos" => {
                 self.blockchain_transaction_id_from_pos(&params)
             }
@@ -322,7 +353,7 @@ impl Connection {
             "server.donation_address" => self.server_donation_address(),
             "server.peers.subscribe" => self.server_peers_subscribe(),
             "server.ping" => Ok(Value::Null),
-            "server.version" => self.server_version(),
+            "server.version" => self.server_version(params),
             &_ => bail!("unknown method {} {:?}", method, params),
         };
         timer.observe_duration();
@@ -387,10 +418,10 @@ impl Connection {
         Ok(())
     }
 
-    fn handle_replies(&mut self) -> Result<()> {
+    fn handle_replies(&mut self, receiver: Receiver<Message>) -> Result<()> {
         let empty_params = json!([]);
         loop {
-            let msg = self.chan.receiver().recv().chain_err(|| "channel closed")?;
+            let msg = receiver.recv().chain_err(|| "channel closed")?;
             trace!("RPC {:?}", msg);
             match msg {
                 Message::Request(line) => {
@@ -420,7 +451,7 @@ impl Connection {
         }
     }
 
-    fn handle_requests(mut reader: BufReader<TcpStream>, tx: SyncSender<Message>) -> Result<()> {
+    fn parse_requests(mut reader: BufReader<TcpStream>, tx: SyncSender<Message>) -> Result<()> {
         loop {
             let mut line = Vec::<u8>::new();
             reader
@@ -448,11 +479,11 @@ impl Connection {
         }
     }
 
-    pub fn run(mut self) {
+    pub fn run(mut self, receiver: Receiver<Message>) {
         let reader = BufReader::new(self.stream.try_clone().expect("failed to clone TcpStream"));
-        let tx = self.chan.sender();
-        let child = spawn_thread("reader", || Connection::handle_requests(reader, tx));
-        if let Err(e) = self.handle_replies() {
+        let sender = self.sender.clone();
+        let child = spawn_thread("reader", || Connection::parse_requests(reader, sender));
+        if let Err(e) = self.handle_replies(receiver) {
             error!(
                 "[{}] connection handling failed: {}",
                 self.addr,
@@ -568,15 +599,16 @@ impl RPC {
                 while let Some((stream, addr)) = acceptor.receiver().recv().unwrap() {
                     // explicitely scope the shadowed variables for the new thread
                     let query = Arc::clone(&query);
-                    let senders = Arc::clone(&senders);
                     let stats = Arc::clone(&stats);
                     let garbage_sender = garbage_sender.clone();
+                    let (sender, receiver) = mpsc::sync_channel(10);
+
+                    senders.lock().unwrap().push(sender.clone());
 
                     let spawned = spawn_thread("peer", move || {
                         info!("[{}] connected peer", addr);
-                        let conn = Connection::new(query, stream, addr, stats, relayfee);
-                        senders.lock().unwrap().push(conn.chan.sender());
-                        conn.run();
+                        let conn = Connection::new(query, stream, addr, stats, relayfee, sender);
+                        conn.run(receiver);
                         info!("[{}] disconnected peer", addr);
                         let _ = garbage_sender.send(std::thread::current().id());
                     });

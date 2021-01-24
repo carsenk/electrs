@@ -1,10 +1,8 @@
-use bincode;
 use bitcoin::blockdata::block::{Block, BlockHeader};
 use bitcoin::blockdata::transaction::{Transaction, TxIn, TxOut};
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hash_types::{BlockHash, Txid};
-use crypto::digest::Digest;
-use crypto::sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::iter::FromIterator;
 use std::sync::RwLock;
@@ -20,7 +18,6 @@ use crate::util::{
     full_hash, hash_prefix, spawn_thread, Bytes, FullHash, HashPrefix, HeaderEntry, HeaderList,
     HeaderMap, SyncChannel, HASH_PREFIX_LEN,
 };
-use bitcoin::BitcoinHash;
 
 #[derive(Serialize, Deserialize)]
 pub struct TxInKey {
@@ -163,11 +160,9 @@ struct BlockKey {
 }
 
 pub fn compute_script_hash(data: &[u8]) -> FullHash {
-    let mut hash = FullHash::default();
     let mut sha2 = Sha256::new();
-    sha2.input(data);
-    sha2.result(&mut hash);
-    hash
+    sha2.update(data);
+    sha2.finalize().into()
 }
 
 pub fn index_transaction<'a>(
@@ -196,7 +191,7 @@ pub fn index_transaction<'a>(
 }
 
 pub fn index_block<'a>(block: &'a Block, height: usize) -> impl 'a + Iterator<Item = Row> {
-    let blockhash = block.bitcoin_hash();
+    let blockhash = block.block_hash();
     // Persist block hash and header
     let row = Row {
         key: bincode::serialize(&BlockKey {
@@ -264,7 +259,7 @@ fn read_indexed_headers(store: &dyn ReadStore) -> HeaderList {
     assert_eq!(
         headers
             .last()
-            .map(BlockHeader::bitcoin_hash)
+            .map(BlockHeader::block_hash)
             .unwrap_or(null_hash),
         latest_blockhash
     );
@@ -411,7 +406,7 @@ impl Index {
             }
 
             let rows_iter = batch.iter().flat_map(|block| {
-                let blockhash = block.bitcoin_hash();
+                let blockhash = block.block_hash();
                 let height = *height_map
                     .get(&blockhash)
                     .unwrap_or_else(|| panic!("missing header for block {}", blockhash));
