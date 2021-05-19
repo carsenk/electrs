@@ -60,13 +60,13 @@ fn parse_error_code(err: &Value) -> Option<i64> {
     err.as_object()?.get("code")?.as_i64()
 }
 
-fn check_error_code(reply_obj: &Map<String, Value>, method: &str) -> Result<()> {
-    if let Some(err) = reply_obj.get("error") {
+fn check_error_code(reply_obj: &mut Map<String, Value>, method: &str) -> Result<()> {
+    if let Some(err) = reply_obj.remove("error") {
         if let Some(code) = parse_error_code(&err) {
             match code {
                 // RPC_IN_WARMUP -> retry by later reconnection
                 -28 => bail!(ErrorKind::Connection(err.to_string())),
-                _ => bail!("{} RPC error: {}", method, err),
+                _ => bail!(ErrorKind::Daemon(method.to_owned(), err)),
             }
         }
     }
@@ -75,7 +75,6 @@ fn check_error_code(reply_obj: &Map<String, Value>, method: &str) -> Result<()> 
 
 fn parse_jsonrpc_reply(mut reply: Value, method: &str, expected_id: u64) -> Result<Value> {
     if let Some(reply_obj) = reply.as_object_mut() {
-        check_error_code(reply_obj, method)?;
         let id = reply_obj
             .get("id")
             .chain_err(|| format!("no id in reply: {:?}", reply_obj))?
@@ -88,6 +87,7 @@ fn parse_jsonrpc_reply(mut reply: Value, method: &str, expected_id: u64) -> Resu
                 expected_id
             );
         }
+        check_error_code(reply_obj, method)?;
         if let Some(result) = reply_obj.get_mut("result") {
             return Ok(result.take());
         }
@@ -516,19 +516,6 @@ impl Daemon {
             .get_or_else(&blockhash, || self.load_blocktxids(blockhash))
     }
 
-    pub fn getblocks(&self, blockhashes: &[BlockHash]) -> Result<Vec<Block>> {
-        let params_list: Vec<Value> = blockhashes
-            .iter()
-            .map(|hash| json!([hash.to_hex(), /*verbose=*/ false]))
-            .collect();
-        let values = self.requests("getblock", &params_list)?;
-        let mut blocks = vec![];
-        for value in values {
-            blocks.push(block_from_value(value)?);
-        }
-        Ok(blocks)
-    }
-
     pub fn gettransaction(
         &self,
         txhash: &Txid,
@@ -552,21 +539,6 @@ impl Daemon {
             args.as_array_mut().unwrap().push(json!(blockhash.to_hex()));
         }
         Ok(self.request("getrawtransaction", args)?)
-    }
-
-    pub fn gettransactions(&self, txhashes: &[&Txid]) -> Result<Vec<Transaction>> {
-        let params_list: Vec<Value> = txhashes
-            .iter()
-            .map(|txhash| json!([txhash.to_hex(), /*verbose=*/ false]))
-            .collect();
-
-        let values = self.requests("getrawtransaction", &params_list)?;
-        let mut txs = vec![];
-        for value in values {
-            txs.push(tx_from_value(value)?);
-        }
-        assert_eq!(txhashes.len(), txs.len());
-        Ok(txs)
     }
 
     pub fn getmempooltxids(&self) -> Result<HashSet<Txid>> {
